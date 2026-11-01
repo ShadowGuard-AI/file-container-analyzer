@@ -16,6 +16,11 @@ def setup_argparse():
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output (debug logging).")
     return parser.parse_args()
 
+# Entry names in an archive are attacker controlled text, so I take them
+# apart instead of trusting them. Backslashes are normalised first, then
+# every empty, dot, and dotdot part is dropped, which is what keeps an
+# entry from landing outside the output directory. An entry made of
+# nothing but those parts sanitises to no path at all and is skipped.
 def _sanitized_parts(name):
     parts = []
     for part in pathlib.PurePosixPath(name.replace('\\', '/')).parts:
@@ -30,6 +35,10 @@ def _target_for(output_dir, entry_name):
         return None
     return pathlib.Path(output_dir).joinpath(*parts)
 
+# Both extractors run the same preflight before writing anything: if any
+# entry would land on the container file itself, the whole run is
+# refused. Extracting the earlier entries first and failing halfway
+# would leave a half written tree and a destroyed container.
 def extract_zip(filepath, output_dir, list_only):
     """Extracts files from a ZIP/JAR archive. Returns (ok, entry_count)."""
     try:
@@ -59,6 +68,11 @@ def extract_zip(filepath, output_dir, list_only):
                 try:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     with zip_ref.open(file_info) as source:
+                        # Each entry is read whole into memory before its file is opened. For
+                        # the archive sizes this tool is aimed at that is fine, and it means a
+                        # corrupt entry fails before its output file is created. A failure on a
+                        # later entry still leaves the earlier extracted files on disk; there
+                        # is no rollback.
                         data = source.read()
                     with open(target, 'wb') as out:
                         out.write(data)
@@ -137,7 +151,12 @@ def main():
         logging.error(f"File not found: {filepath}")
         print(f"Error: container not found: {filepath}")
         return 1
+    # The output directory is created before the format is even known. A run
+    # that then fails as unsupported still leaves the directory behind.
     pathlib.Path(output_dir).mkdir(parents=True, exist_ok=True)
+    # Dispatch is by content, not extension: is_zipfile reads the zip magic,
+    # so a JAR or a renamed archive takes the zip path, and a file that is
+    # neither zip nor OLE is refused after the OLE check below.
     if zipfile.is_zipfile(filepath):
         ok, count = extract_zip(filepath, output_dir, list_only)
     else:
@@ -149,6 +168,9 @@ def main():
             is_ole = False
             # A non-ZIP file may be OLE; without olefile it cannot be analyzed here.
             with open(filepath, 'rb') as f:
+                # When olefile is missing I still read the eight byte OLE signature by
+                # hand, so the error can say the file is an OLE container that needs the
+                # package instead of the misleading unsupported format message.
                 header = f.read(8)
             if header == bytes.fromhex('D0CF11E0A1B11AE1'):
                 logging.error("OLE container needs the olefile package, which is not installed.")
